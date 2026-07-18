@@ -1,498 +1,574 @@
 "use client";
 
-import { useState, useCallback, useRef, useEffect } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
+import { useBLE } from "../hooks/useBLE";
+import { VerticalFader } from "../components/Fader";
+import { 
+  Bluetooth, 
+  Wifi, 
+  Thermometer, 
+  Volume2, 
+  Activity, 
+  Sparkles, 
+  Sliders, 
+  Gauge
+} from "lucide-react";
 
-// ─── BLE UUID Constants ───
-const SERVICE_UUID = "4fa8c820-1f87-11e9-ab14-d663bd873d93";
-const CHARACTERISTIC_UUID = "4a240bbd-26b7-48c7-9a3f-c151d3d45388";
-
-// ─── Web Bluetooth Type Declarations ───
-interface BluetoothRequestDeviceFilter {
-  name?: string;
-  namePrefix?: string;
-  services?: BluetoothServiceUUID[];
-}
-
-type BluetoothServiceUUID = string | number;
-
-interface RequestDeviceOptions {
-  filters?: BluetoothRequestDeviceFilter[];
-  optionalServices?: BluetoothServiceUUID[];
-  acceptAllDevices?: boolean;
-}
-
-interface BluetoothRemoteGATTCharacteristic {
-  writeValue(value: BufferSource): Promise<void>;
-  writeValueWithoutResponse(value: BufferSource): Promise<void>;
-  readValue(): Promise<DataView>;
-}
-
-interface BluetoothRemoteGATTService {
-  getCharacteristic(
-    characteristic: BluetoothServiceUUID
-  ): Promise<BluetoothRemoteGATTCharacteristic>;
-}
-
-interface BluetoothRemoteGATTServer {
-  connect(): Promise<BluetoothRemoteGATTServer>;
-  disconnect(): void;
-  connected: boolean;
-  getPrimaryService(
-    service: BluetoothServiceUUID
-  ): Promise<BluetoothRemoteGATTService>;
-}
-
-interface BluetoothDevice {
-  name?: string;
-  gatt?: BluetoothRemoteGATTServer;
-  addEventListener(type: string, listener: EventListener): void;
-  removeEventListener(type: string, listener: EventListener): void;
-}
-
-interface Bluetooth {
-  requestDevice(options: RequestDeviceOptions): Promise<BluetoothDevice>;
-}
-
-// ─── Fader Channel Configuration ───
-interface FaderConfig {
-  id: string;
-  label: string;
-  asciiCode: number;
-  defaultValue: number;
-  min: number;
-  max: number;
-  accentColor: string;
-  isMaster?: boolean;
-}
-
-const FADERS: FaderConfig[] = [
-  { id: "fader-high", label: "HIGH",    asciiCode: 72, defaultValue: 100, min: 0, max: 200, accentColor: "#00e5ff" },
-  { id: "fader-mid",  label: "MID",     asciiCode: 77, defaultValue: 100, min: 0, max: 200, accentColor: "#ffab00" },
-  { id: "fader-low",  label: "LOW",     asciiCode: 76, defaultValue: 100, min: 0, max: 200, accentColor: "#00e676" },
-  { id: "fader-fx",   label: "FX",      asciiCode: 88, defaultValue: 0,   min: 0, max: 200, accentColor: "#ff6d00" },
-  { id: "fader-vol",  label: "VOL",     asciiCode: 86, defaultValue: 40,  min: 0, max: 100, accentColor: "#00e676", isMaster: true },
+// Presets data list
+const PRESETS = [
+  { name: "Flat", values: { L: 50, M: 50, H: 50, Q: 50, G: 0, E: 0, R: 50, W: 50, Y: 50, N: 0, I: 100 } },
+  { name: "Rock", values: { L: 75, M: 40, H: 70, Q: 60, G: 65, E: 60, R: 45, W: 55, Y: 65, N: 15, I: 85 } },
+  { name: "Pop", values: { L: 60, M: 65, H: 60, Q: 55, G: 50, E: 50, R: 60, W: 50, Y: 55, N: 10, I: 90 } },
+  { name: "Jazz", values: { L: 65, M: 55, H: 45, Q: 50, G: 45, E: 40, R: 50, W: 60, Y: 45, N: 12, I: 95 } },
+  { name: "Movie", values: { L: 80, M: 45, H: 65, Q: 85, G: 70, E: 60, R: 50, W: 65, Y: 55, N: 20, I: 75 } },
+  { name: "Bass Boost", values: { L: 90, M: 50, H: 50, Q: 95, G: 90, E: 45, R: 50, W: 70, Y: 45, N: 15, I: 80 } },
+  { name: "Gaming", values: { L: 65, M: 40, H: 75, Q: 60, G: 55, E: 70, R: 45, W: 50, Y: 70, N: 25, I: 70 } },
+  { name: "Podcast", values: { L: 40, M: 75, H: 60, Q: 35, G: 30, E: 50, R: 70, W: 45, Y: 50, N: 30, I: 90 } },
+  { name: "Vocal", values: { L: 45, M: 80, H: 65, Q: 40, G: 35, E: 55, R: 75, W: 40, Y: 60, N: 15, I: 95 } },
 ];
 
-// ─── Helpers ───
-function getBluetoothAPI(): Bluetooth | null {
-  if (typeof navigator !== "undefined" && "bluetooth" in navigator) {
-    return (navigator as unknown as { bluetooth: Bluetooth }).bluetooth;
-  }
-  return null;
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
-}
-
-// ─── VU Meter Component (vertical LED bar per channel) ───
-const VU_LED_COUNT = 16;
-
-function VuBar({ faderValue, max, accentColor }: { faderValue: number; max: number; accentColor: string }) {
-  const [levels, setLevels] = useState<number[]>(Array(VU_LED_COUNT).fill(0));
-  const prevLevels = useRef<number[]>(Array(VU_LED_COUNT).fill(0));
-  const animRef = useRef<number>(0);
-
-  useEffect(() => {
-    let active = true;
-    const animate = () => {
-      if (!active) return;
-      const baseActive = Math.round((faderValue / max) * VU_LED_COUNT);
-      const jitter = Math.random() * 2.5 - 0.8;
-      const targetActive = clamp(Math.round(baseActive + jitter), 0, VU_LED_COUNT);
-
-      const newLevels: number[] = [];
-      for (let i = 0; i < VU_LED_COUNT; i++) {
-        const target = i < targetActive ? 1 : 0;
-        const prev = prevLevels.current[i];
-        newLevels.push(target > prev ? Math.min(1, prev + 0.35) : Math.max(0, prev - 0.06));
-      }
-      prevLevels.current = newLevels;
-      setLevels([...newLevels]);
-      animRef.current = requestAnimationFrame(animate);
-    };
-    animRef.current = requestAnimationFrame(animate);
-    return () => { active = false; cancelAnimationFrame(animRef.current); };
-  }, [faderValue, max]);
-
-  return (
-    <div className="vu-bar">
-      {levels.map((level, i) => {
-        const isActive = level > 0.3;
-        // Color transitions: bottom green → mid yellow → top red
-        let bg = accentColor;
-        if (i >= VU_LED_COUNT * 0.85) bg = "#ff1744";
-        else if (i >= VU_LED_COUNT * 0.65) bg = "#ffea00";
-        return (
-          <div
-            key={i}
-            className={`vu-bar-led ${isActive ? "active" : ""}`}
-            style={{
-              opacity: isActive ? 0.5 + level * 0.5 : 0.08,
-              background: isActive ? bg : "rgba(255,255,255,0.04)",
-              boxShadow: isActive ? `0 0 4px ${bg}, 0 0 8px ${bg}40` : "none",
-            }}
-          />
-        );
-      })}
-    </div>
-  );
-}
-
-// ─── Single Vertical Fader Channel ───
-function VerticalFader({
-  config,
-  value,
-  onChange,
-}: {
-  config: FaderConfig;
-  value: number;
-  onChange: (value: number) => void;
-}) {
-  const fillPercent = ((value - config.min) / (config.max - config.min)) * 100;
-
-  return (
-    <div className={`eq-channel ${config.isMaster ? "master" : ""}`}>
-      {/* Value readout */}
-      <div className="ch-value" style={{ color: config.accentColor }}>
-        {value}
-      </div>
-
-      {/* Fader + VU stack */}
-      <div className="ch-fader-area">
-        {/* VU bar on the left */}
-        <VuBar faderValue={value} max={config.max} accentColor={config.accentColor} />
-
-        {/* Fader track */}
-        <div className="ch-track">
-          {/* Tick marks */}
-          <div className="ch-ticks">
-            {Array.from({ length: 11 }, (_, i) => (
-              <div key={i} className={`ch-tick ${i % 5 === 0 ? "major" : ""}`} />
-            ))}
-          </div>
-
-          {/* Center line for EQ bands (at 50% = value 100) */}
-          {!config.isMaster && <div className="ch-center-line" />}
-
-          {/* Fill glow */}
-          <div
-            className="ch-fill"
-            style={{
-              height: `${fillPercent}%`,
-              background: `linear-gradient(0deg, ${config.accentColor}08, ${config.accentColor}30)`,
-            }}
-          />
-
-          {/* Range input */}
-          <input
-            id={config.id}
-            type="range"
-            min={config.min}
-            max={config.max}
-            step={1}
-            value={value}
-            onChange={(e) => onChange(parseInt(e.target.value, 10))}
-            className="ch-slider"
-            aria-label={config.label}
-            style={{
-              // Pass accent color to thumb via CSS custom property
-              "--fader-accent": config.accentColor,
-            } as React.CSSProperties}
-          />
-        </div>
-      </div>
-
-      {/* Label */}
-      <div className="ch-label" style={{ color: config.accentColor }}>
-        {config.label}
-      </div>
-
-      {/* LED dot */}
-      <div
-        className="ch-led"
-        style={{
-          background: config.accentColor,
-          boxShadow: `0 0 6px ${config.accentColor}, 0 0 12px ${config.accentColor}60`,
-        }}
-      />
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════
-// MAIN PAGE COMPONENT
-// ═══════════════════════════════════════════════════
 export default function HomePage() {
-  // BLE State
-  const [isConnected, setIsConnected] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [deviceName, setDeviceName] = useState<string>("");
+  const {
+    isConnected,
+    isConnecting,
+    error,
+    deviceName,
+    telemetry,
+    vuLeftRef,
+    vuRightRef,
+    sendDSPCommand,
+    connectDevice,
+    disconnectDevice,
+  } = useBLE();
 
-  // Fader values (HIGH, MID, LOW, FX, VOL)
-  const [faderValues, setFaderValues] = useState<number[]>(
-    FADERS.map((f) => f.defaultValue)
-  );
+  // Slider State (Mapped to 0-100 range)
+  const [sliders, setSliders] = useState<{ [key: string]: number }>({
+    V: 40,  // Master Volume
+    B: 50,  // Balance (50 = Center)
+    S: 50,  // Stereo Width
+    
+    // EQ
+    L: 50,  // Bass
+    M: 50,  // Mid
+    H: 50,  // Treble
+    
+    // Pro EQ
+    Q: 50,  // Sub Level
+    G: 0,   // Bass Boost
+    E: 0,   // Treble Boost
+    R: 50,  // Presence
+    W: 50,  // Warmth
+    Y: 50,  // Brightness
+    
+    // Dynamics
+    N: 0,   // Noise Gate
+    I: 100, // Limiter
+  });
 
-  // BLE Refs
-  const deviceRef = useRef<BluetoothDevice | null>(null);
-  const characteristicRef =
-    useRef<BluetoothRemoteGATTCharacteristic | null>(null);
+  // Toggles State
+  const [toggles, setToggles] = useState({
+    mute: false,
+    bypass: false,
+    stereo: true,
+    loudness: false,
+  });
 
-  // ── Write to BLE ──
-  const writeBLE = useCallback(async (data: Uint8Array) => {
-    try {
-      if (!characteristicRef.current) {
-        console.warn("[BLE] No characteristic available for write.");
-        return;
-      }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      await characteristicRef.current.writeValueWithoutResponse(data as any);
-    } catch (err) {
-      console.error("[BLE] Write failed:", err);
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        await characteristicRef.current?.writeValue(data as any);
-      } catch (fallbackErr) {
-        console.error("[BLE] Fallback write also failed:", fallbackErr);
-        setError("Failed to send command. Check connection.");
-      }
-    }
-  }, []);
+  const [activePreset, setActivePreset] = useState<number | null>(0);
 
-  // ── Connect ──
-  const handleConnect = useCallback(async () => {
-    const bt = getBluetoothAPI();
-    if (!bt) {
-      setError("Web Bluetooth is not supported in this browser.");
-      return;
-    }
+  // References to VU Meter HTML elements to update them directly
+  const leftMeterRef = useRef<HTMLDivElement>(null);
+  const rightMeterRef = useRef<HTMLDivElement>(null);
+  const leftPeakRef = useRef<HTMLDivElement>(null);
+  const rightPeakRef = useRef<HTMLDivElement>(null);
 
-    setIsConnecting(true);
-    setError(null);
+  const leftMaxPeak = useRef(0);
+  const rightMaxPeak = useRef(0);
+  const leftDisplayed = useRef(0);
+  const rightDisplayed = useRef(0);
 
-    try {
-      const device = await bt.requestDevice({
-        filters: [{ name: "Ampli-Smart-DSP" }],
-        optionalServices: [SERVICE_UUID],
-      });
-
-      deviceRef.current = device;
-      setDeviceName(device.name ?? "DSP Device");
-
-      device.addEventListener("gattserverdisconnected", () => {
-        setIsConnected(false);
-        characteristicRef.current = null;
-        setError(null);
-      });
-
-      if (!device.gatt) {
-        throw new Error("GATT server not available on this device.");
-      }
-
-      const server = await device.gatt.connect();
-      const service = await server.getPrimaryService(SERVICE_UUID);
-      const characteristic = await service.getCharacteristic(
-        CHARACTERISTIC_UUID
-      );
-
-      characteristicRef.current = characteristic;
-      setIsConnected(true);
-    } catch (err: unknown) {
-      if (err instanceof Error) {
-        if (err.message.includes("User cancelled")) {
-          setError(null);
-        } else {
-          console.error("[BLE] Connection error:", err);
-          setError(err.message);
-        }
-      } else {
-        console.error("[BLE] Unknown connection error:", err);
-        setError("An unknown error occurred.");
-      }
-    } finally {
-      setIsConnecting(false);
-    }
-  }, []);
-
-  // ── Disconnect ──
-  const handleDisconnect = useCallback(() => {
-    try {
-      deviceRef.current?.gatt?.disconnect();
-    } catch (err) {
-      console.error("[BLE] Disconnect error:", err);
-    }
-    characteristicRef.current = null;
-    deviceRef.current = null;
-    setIsConnected(false);
-    setDeviceName("");
-  }, []);
-
-  // ── Fader Change ──
-  const handleFaderChange = useCallback(
-    (faderIndex: number, newValue: number) => {
-      setFaderValues((prev) => {
-        const updated = [...prev];
-        updated[faderIndex] = newValue;
-        return updated;
-      });
-      const data = new Uint8Array([FADERS[faderIndex].asciiCode, newValue]);
-      writeBLE(data);
-    },
-    [writeBLE]
-  );
-
-  // ── Clear error after timeout ──
+  // High-performance requestAnimationFrame loop to read BLE VU ref data
   useEffect(() => {
-    if (error) {
-      const timer = setTimeout(() => setError(null), 5000);
-      return () => clearTimeout(timer);
+    let animId: number;
+    const updateVUMeters = () => {
+      const lRaw = vuLeftRef.current; // 0-255
+      const rRaw = vuRightRef.current; // 0-255
+
+      // Scale raw 0-255 to 0-100% using square-root scaling for audio responsiveness
+      const lTarget = Math.sqrt(lRaw / 255) * 100;
+      const rTarget = Math.sqrt(rRaw / 255) * 100;
+
+      // Physics: Instant attack (rise), quick exponential decay (fall)
+      if (lTarget > leftDisplayed.current) {
+        leftDisplayed.current = lTarget;
+      } else {
+        leftDisplayed.current = leftDisplayed.current * 0.7 + lTarget * 0.3;
+      }
+
+      if (rTarget > rightDisplayed.current) {
+        rightDisplayed.current = rTarget;
+      } else {
+        rightDisplayed.current = rightDisplayed.current * 0.7 + rTarget * 0.3;
+      }
+
+      // Update Meter heights
+      if (leftMeterRef.current) {
+        leftMeterRef.current.style.height = `${leftDisplayed.current}%`;
+      }
+      if (rightMeterRef.current) {
+        rightMeterRef.current.style.height = `${rightDisplayed.current}%`;
+      }
+
+      // Peak indicators decay logic (decay peak slower than the main signal)
+      if (lTarget > leftMaxPeak.current) {
+        leftMaxPeak.current = lTarget;
+      } else {
+        leftMaxPeak.current = Math.max(0, leftMaxPeak.current - 0.7);
+      }
+
+      if (rTarget > rightMaxPeak.current) {
+        rightMaxPeak.current = rTarget;
+      } else {
+        rightMaxPeak.current = Math.max(0, rightMaxPeak.current - 0.7);
+      }
+
+      if (leftPeakRef.current) {
+        leftPeakRef.current.style.bottom = `${leftMaxPeak.current}%`;
+      }
+      if (rightPeakRef.current) {
+        rightPeakRef.current.style.bottom = `${rightMaxPeak.current}%`;
+      }
+
+      animId = requestAnimationFrame(updateVUMeters);
+    };
+
+    animId = requestAnimationFrame(updateVUMeters);
+    return () => cancelAnimationFrame(animId);
+  }, [vuLeftRef, vuRightRef]);
+
+  // Synchronize telemetry data coming from ESP32
+  useEffect(() => {
+    if (isConnected) {
+      queueMicrotask(() => {
+        setSliders((prev) => {
+          if (prev.V === telemetry.volume) return prev;
+          return {
+            ...prev,
+            V: telemetry.volume,
+          };
+        });
+        setToggles((prev) => {
+          const nextBypass = !telemetry.dspActive;
+          if (prev.bypass === nextBypass) return prev;
+          return {
+            ...prev,
+            bypass: nextBypass,
+          };
+        });
+        setActivePreset((prev) => {
+          if (prev === telemetry.activePreset) return prev;
+          return telemetry.activePreset;
+        });
+      });
     }
-  }, [error]);
+  }, [telemetry, isConnected]);
+
+  // Command wrapper
+  const handleSliderChange = useCallback((cmd: string, val: number) => {
+    setSliders((prev) => ({ ...prev, [cmd]: val }));
+    sendDSPCommand(cmd, val);
+  }, [sendDSPCommand]);
+
+  // Toggle handlers
+  const handleToggle = useCallback((key: keyof typeof toggles, cmdChar: string) => {
+    const nextVal = !toggles[key];
+    setToggles((prev) => ({ ...prev, [key]: nextVal }));
+    sendDSPCommand(cmdChar, nextVal ? 1 : 0);
+  }, [toggles, sendDSPCommand]);
+
+  // Preset Selector
+  const handlePresetSelect = useCallback((idx: number) => {
+    setActivePreset(idx);
+    sendDSPCommand("P", idx);
+
+    // Apply local preset values
+    const preset = PRESETS[idx];
+    setSliders((prev) => {
+      const next = { ...prev };
+      Object.keys(preset.values).forEach((key) => {
+        const val = preset.values[key as keyof typeof preset.values];
+        next[key] = val;
+        sendDSPCommand(key, val);
+      });
+      return next;
+    });
+  }, [sendDSPCommand]);
 
   return (
-    <main className="eq-console">
-      {/* ═══ Header / BLE ═══ */}
-      <header className="eq-header animate-in">
-        <div className="eq-brand">
-          <div className="eq-brand-logo">
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth={1.5}
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              style={{ width: 16, height: 16, color: "#00e5ff" }}
-            >
-              <path d="M9 18V5l12-2v13" />
-              <circle cx="6" cy="18" r="3" />
-              <circle cx="18" cy="16" r="3" />
-            </svg>
+    <main className="min-h-screen bg-[#09090B] text-[#E4E4E7] p-4 lg:p-6 flex flex-col gap-6 selection:bg-[#00E5FF]/20">
+      
+      {/* ── TOP BAR (TELEMETRY & BLE) ── */}
+      <header className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4 bg-[#18181B] border border-[#27272A] rounded-2xl p-4 shadow-2xl relative">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-[#2E2E36] to-[#121215] border border-[#3A3A44] flex items-center justify-center relative shadow-lg">
+            <Activity className="w-5.5 h-5.5 text-[#00E5FF] animate-pulse" />
+            <div className={`w-2.5 h-2.5 rounded-full absolute -top-0.5 -right-0.5 border border-black transition-colors duration-300 ${isConnected ? "bg-[#00E676] shadow-[0_0_8px_#00E676]" : "bg-[#FF1744]"}`} />
           </div>
           <div>
-            <h1 className="eq-title">
-              Bit<span>Tune</span>
+            <h1 className="text-lg font-black tracking-tighter text-[#F4F4F5] uppercase">
+              Bit<span className="text-[#00E5FF]">Tune</span> DSP
             </h1>
-            <p className="eq-subtitle">Graphic EQ · DSP</p>
+            <p className="text-[9px] font-mono text-[#71717A] tracking-wider uppercase">6-Band Parametric Equalizer</p>
           </div>
         </div>
 
-        {isConnected ? (
-          <div className="ble-connected-row">
-            <div className="ble-status-indicator">
-              <div className="ble-dot-wrap">
-                <span className="ble-ping" />
-                <span className="ble-dot" />
-              </div>
-              <span className="ble-name">{deviceName}</span>
+        {/* Telemetry Display */}
+        <div className="flex flex-wrap items-center gap-6 bg-[#0E0E11] border border-[#27272A]/80 rounded-xl px-4 py-2 text-xs font-mono">
+          {/* Signal */}
+          <div className="flex items-center gap-2">
+            <Wifi className="w-4 h-4 text-[#00E5FF]" />
+            <div className="flex flex-col">
+              <span className="text-[8px] text-[#71717A] uppercase">Signal</span>
+              <span className="font-bold">{isConnected ? `${telemetry.signalQuality}%` : "0%"}</span>
             </div>
-            <button
-              id="btn-disconnect"
-              onClick={handleDisconnect}
-              className="ble-btn-disconnect"
-            >
-              Disconnect
-            </button>
           </div>
-        ) : (
-          <button
-            id="btn-connect"
-            onClick={handleConnect}
-            disabled={isConnecting}
-            className="ble-btn-connect"
-          >
-            {isConnecting ? (
-              <>
-                <svg
-                  style={{ width: 14, height: 14 }}
-                  className="animate-spin"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                >
-                  <circle
-                    opacity={0.25}
-                    cx="12"
-                    cy="12"
-                    r="10"
-                    stroke="currentColor"
-                    strokeWidth="4"
-                  />
-                  <path
-                    opacity={0.75}
-                    fill="currentColor"
-                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-                  />
-                </svg>
-                Scanning…
-              </>
-            ) : (
-              <>
-                <svg
-                  style={{ width: 14, height: 14 }}
-                  fill="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path d="M14.24 12.01l2.32 2.32c.28-.72.44-1.51.44-2.33 0-.82-.16-1.59-.43-2.31l-2.33 2.32zm5.29-5.3l-1.26 1.26c.63 1.21.98 2.57.98 4.02s-.36 2.82-.98 4.02l1.2 1.2a9.936 9.936 0 001.54-5.22c-.01-1.89-.55-3.67-1.48-5.28zm-3.82 1L10 2H9v7.59L4.41 5 3 6.41 8.59 12 3 17.59 4.41 19 9 14.41V22h1l5.71-5.71-4.3-4.29 4.3-4.29zM11 5.83l1.88 1.88L11 9.59V5.83zm1.88 10.46L11 18.17v-3.76l1.88 1.88z" />
-                </svg>
-                Connect BLE
-              </>
-            )}
-          </button>
-        )}
+
+          {/* SoC Temp */}
+          <div className="flex items-center gap-2">
+            <Thermometer className="w-4 h-4 text-[#FFB300]" />
+            <div className="flex flex-col">
+              <span className="text-[8px] text-[#71717A] uppercase">SoC Temp</span>
+              <span className="font-bold">{isConnected ? `${telemetry.temp}°C` : "0°C"}</span>
+            </div>
+          </div>
+
+          {/* Limiter Fired Status */}
+          <div className="flex items-center gap-3">
+            <div className="flex flex-col">
+              <span className="text-[8px] text-[#71717A] uppercase">Limiter</span>
+              <span className={`font-bold transition-colors ${telemetry.limiterFired ? "text-[#FF1744]" : "text-[#71717A]"}`}>
+                {telemetry.limiterFired ? "ACTIVE" : "BYPASS"}
+              </span>
+            </div>
+            <div className={`w-3 h-3 rounded-full border border-black/40 transition-all ${telemetry.limiterFired ? "bg-[#FF1744] shadow-[0_0_10px_#FF1744]" : "bg-[#FF1744]/20"}`} />
+          </div>
+        </div>
+
+        {/* Connection Control */}
+        <div>
+          {isConnected ? (
+            <div className="flex items-center gap-2.5 bg-[#0F0F12] border border-[#00E676]/30 px-3 py-1.5 rounded-xl">
+              <span className="text-xs font-mono text-[#00E676] truncate max-w-[130px]">{deviceName}</span>
+              <button
+                onClick={disconnectDevice}
+                className="px-2.5 py-1 text-[10px] font-mono font-bold text-[#FF1744] bg-[#FF1744]/10 hover:bg-[#FF1744]/20 border border-[#FF1744]/20 rounded-md transition-all cursor-pointer"
+              >
+                DISCONNECT
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={connectDevice}
+              disabled={isConnecting}
+              className={`px-4 py-2 border rounded-xl font-mono text-xs font-bold tracking-wider uppercase transition-all flex items-center gap-2 cursor-pointer shadow-lg ${
+                isConnecting
+                  ? "bg-[#FFB300]/10 border-[#FFB300] text-[#FFB300] animate-pulse"
+                  : "bg-gradient-to-b from-[#00E5FF]/20 to-[#00E5FF]/5 border-[#00E5FF] text-[#00E5FF] hover:from-[#00E5FF]/30 hover:to-[#00E5FF]/10 shadow-[0_0_15px_rgba(0,229,255,0.1)]"
+              }`}
+            >
+              <Bluetooth className={`w-4 h-4 ${isConnecting ? "animate-spin" : ""}`} />
+              {isConnecting ? "Connecting..." : "Connect DSP"}
+            </button>
+          )}
+        </div>
       </header>
 
-      {/* ═══ Error Toast ═══ */}
+      {/* Error alert toast */}
       {error && (
-        <div className="eq-error">
-          <svg
-            style={{ width: 14, height: 14, flexShrink: 0 }}
-            fill="none"
-            viewBox="0 0 24 24"
-            strokeWidth={1.5}
-            stroke="currentColor"
-          >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z"
-            />
-          </svg>
-          <span>{error}</span>
+        <div className="p-3 bg-[#FF1744]/10 border border-[#FF1744]/30 text-[#FF1744] rounded-xl text-xs font-mono">
+          {error}
         </div>
       )}
 
-      {/* ═══ EQ Rack ═══ */}
-      <div className="eq-rack animate-in-d1">
-        {/* Rack label bar */}
-        <div className="rack-label-bar">
-          <span className="rack-label">DSP EQUALIZER</span>
-          <span className="rack-range">0 — 200 GAIN</span>
+      {/* ── MAIN WORKSPACE GRID ── */}
+      <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
+
+        {/* LEFT PANEL: VU METERS & VOLUME */}
+        <div className="xl:col-span-4 bg-[#18181B] border border-[#27272A] rounded-2xl p-4 shadow-xl flex flex-col gap-6">
+          <h2 className="text-xs font-mono text-[#71717A] tracking-wider uppercase flex items-center gap-2">
+            <Volume2 className="w-4 h-4 text-[#00E5FF]" /> Master Output Bus
+          </h2>
+
+          <div className="grid grid-cols-12 gap-6 items-stretch">
+            {/* L/R VU Meters */}
+            <div className="col-span-8 flex justify-center gap-8 bg-[#0F0F12] border border-[#27272A]/50 rounded-xl p-4 h-[300px]">
+              {/* Left Channel */}
+              <div className="flex flex-col items-center gap-2 w-full h-full relative">
+                <span className="text-[10px] font-mono text-[#00E5FF] tracking-wider font-bold">LEFT</span>
+                <div className="w-5 flex-1 bg-black/60 border border-white/10 rounded-lg relative overflow-hidden shadow-inner">
+                  <div
+                    ref={leftMeterRef}
+                    className="w-full absolute bottom-0 left-0"
+                    style={{
+                      height: "0%",
+                      background: "linear-gradient(to top, #00E676 0%, #FFB300 70%, #FF1744 100%)",
+                      backgroundSize: "100% 230px",
+                      backgroundPosition: "bottom",
+                      boxShadow: "0 0 12px rgba(0, 230, 118, 0.2)",
+                    }}
+                  />
+                  <div
+                    ref={leftPeakRef}
+                    className="w-full h-0.5 bg-[#FF1744] absolute bottom-0 left-0 shadow-[0_0_8px_#FF1744]"
+                  />
+                  <div
+                    className="absolute inset-0 pointer-events-none opacity-25"
+                    style={{
+                      backgroundImage: "linear-gradient(to bottom, #000 2px, transparent 2px)",
+                      backgroundSize: "100% 6px",
+                    }}
+                  />
+                </div>
+              </div>
+
+              {/* Ticks scale */}
+              <div className="flex flex-col justify-between text-[8px] font-mono text-[#52525B] h-full pt-6 pb-2">
+                <span>100%</span>
+                <span>80%</span>
+                <span>60%</span>
+                <span>40%</span>
+                <span>20%</span>
+                <span>0%</span>
+              </div>
+
+              {/* Right Channel */}
+              <div className="flex flex-col items-center gap-2 w-full h-full relative">
+                <span className="text-[10px] font-mono text-[#00E5FF] tracking-wider font-bold">RIGHT</span>
+                <div className="w-5 flex-1 bg-black/60 border border-white/10 rounded-lg relative overflow-hidden shadow-inner">
+                  <div
+                    ref={rightMeterRef}
+                    className="w-full absolute bottom-0 left-0"
+                    style={{
+                      height: "0%",
+                      background: "linear-gradient(to top, #00E676 0%, #FFB300 70%, #FF1744 100%)",
+                      backgroundSize: "100% 230px",
+                      backgroundPosition: "bottom",
+                      boxShadow: "0 0 12px rgba(0, 230, 118, 0.2)",
+                    }}
+                  />
+                  <div
+                    ref={rightPeakRef}
+                    className="w-full h-0.5 bg-[#FF1744] absolute bottom-0 left-0 shadow-[0_0_8px_#FF1744]"
+                  />
+                  <div
+                    className="absolute inset-0 pointer-events-none opacity-25"
+                    style={{
+                      backgroundImage: "linear-gradient(to bottom, #000 2px, transparent 2px)",
+                      backgroundSize: "100% 6px",
+                    }}
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Master Volume Fader */}
+            <div className="col-span-4 flex justify-center">
+              <VerticalFader
+                config={{
+                  id: "master-vol",
+                  label: "VOLUME",
+                  typeChar: "V",
+                  min: 0,
+                  max: 100,
+                  defaultValue: 40,
+                  accentColor: "#00E676",
+                  isMaster: true,
+                }}
+                value={sliders.V}
+                disabled={!isConnected}
+                onChange={(val) => handleSliderChange("V", val)}
+              />
+            </div>
+          </div>
+
+          {/* Width & Balance */}
+          <div className="grid grid-cols-2 gap-4 border-t border-[#27272A]/40 pt-4">
+            <div className="flex flex-col gap-1.5">
+              <span className="text-[9px] font-mono text-[#71717A] uppercase">Balance</span>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                value={sliders.B}
+                disabled={!isConnected}
+                onChange={(e) => handleSliderChange("B", parseInt(e.target.value))}
+                className="w-full accent-[#00E5FF] cursor-pointer"
+              />
+              <div className="flex justify-between text-[8px] font-mono text-[#52525B]">
+                <span>L</span>
+                <span>{sliders.B}</span>
+                <span>R</span>
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-1.5">
+              <span className="text-[9px] font-mono text-[#71717A] uppercase">Stereo Width</span>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                value={sliders.S}
+                disabled={!isConnected}
+                onChange={(e) => handleSliderChange("S", parseInt(e.target.value))}
+                className="w-full accent-[#00E5FF] cursor-pointer"
+              />
+              <div className="flex justify-between text-[8px] font-mono text-[#52525B]">
+                <span>Mono</span>
+                <span>{sliders.S}%</span>
+                <span>Wide</span>
+              </div>
+            </div>
+          </div>
         </div>
 
-        {/* All faders side by side */}
-        <div className="eq-fader-row">
-          {FADERS.map((fader, index) => (
-            <VerticalFader
-              key={fader.id}
-              config={fader}
-              value={faderValues[index]}
-              onChange={(val) => handleFaderChange(index, val)}
-            />
-          ))}
+        {/* CENTER PANEL: PARAMETRIC EQ SLIDERS */}
+        <div className="xl:col-span-5 bg-[#18181B] border border-[#27272A] rounded-2xl p-4 shadow-xl flex flex-col gap-4">
+          <h2 className="text-xs font-mono text-[#71717A] tracking-wider uppercase flex items-center gap-2">
+            <Sliders className="w-4 h-4 text-[#FFB300]" /> 6-Band Parametric Channel Strip
+          </h2>
+
+          <div className="flex justify-around items-stretch bg-black/20 border border-[#27272A]/50 rounded-xl py-2 overflow-x-auto custom-scrollbar">
+            {/* EQ Slider Configuration */}
+            {[
+              { id: "sub", label: "Sub", typeChar: "Q", min: 0, max: 100, defaultValue: 50, accentColor: "#FF1744" },
+              { id: "bass", label: "Bass", typeChar: "L", min: 0, max: 100, defaultValue: 50, accentColor: "#00E676" },
+              { id: "warmth", label: "Warmth", typeChar: "W", min: 0, max: 100, defaultValue: 50, accentColor: "#FFB300" },
+              { id: "mid", label: "Mid", typeChar: "M", min: 0, max: 100, defaultValue: 50, accentColor: "#FFB300" },
+              { id: "presence", label: "Pres", typeChar: "R", min: 0, max: 100, defaultValue: 50, accentColor: "#40C4FF" },
+              { id: "treble", label: "Treb", typeChar: "H", min: 0, max: 100, defaultValue: 50, accentColor: "#40C4FF" },
+              { id: "bright", label: "Air/Bright", typeChar: "Y", min: 0, max: 100, defaultValue: 50, accentColor: "#00E5FF" },
+            ].map((eq) => (
+              <VerticalFader
+                key={eq.id}
+                config={eq}
+                value={sliders[eq.typeChar]}
+                disabled={!isConnected}
+                onChange={(val) => handleSliderChange(eq.typeChar, val)}
+              />
+            ))}
+          </div>
+
+          {/* Quick Analog Toggles */}
+          <div className="grid grid-cols-4 gap-2 border-t border-[#27272A]/40 pt-4">
+            <button
+              onClick={() => handleToggle("mute", "T")}
+              disabled={!isConnected}
+              className={`py-2 text-[10px] font-mono font-bold border rounded-lg uppercase cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed ${toggles.mute ? "bg-[#FF1744]/15 border-[#FF1744] text-[#FF1744]" : "bg-black/30 border-[#27272A] text-[#71717A]"}`}
+            >
+              Mute
+            </button>
+            <button
+              onClick={() => handleToggle("bypass", "X")}
+              disabled={!isConnected}
+              className={`py-2 text-[10px] font-mono font-bold border rounded-lg uppercase cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed ${toggles.bypass ? "bg-[#FF1744]/15 border-[#FF1744] text-[#FF1744]" : "bg-black/30 border-[#27272A] text-[#71717A]"}`}
+            >
+              Bypass
+            </button>
+            <button
+              onClick={() => handleToggle("stereo", "O")}
+              disabled={!isConnected}
+              className={`py-2 text-[10px] font-mono font-bold border rounded-lg uppercase cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed ${toggles.stereo ? "bg-[#00E5FF]/10 border-[#00E5FF] text-[#00E5FF]" : "bg-black/30 border-[#27272A] text-[#71717A]"}`}
+            >
+              {toggles.stereo ? "Stereo" : "Mono"}
+            </button>
+            <button
+              onClick={() => handleToggle("loudness", "U")}
+              disabled={!isConnected}
+              className={`py-2 text-[10px] font-mono font-bold border rounded-lg uppercase cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed ${toggles.loudness ? "bg-[#00E5FF]/10 border-[#00E5FF] text-[#00E5FF]" : "bg-black/30 border-[#27272A] text-[#71717A]"}`}
+            >
+              Loudness
+            </button>
+          </div>
         </div>
 
-        {/* Bottom scale */}
-        <div className="rack-bottom-bar">
-          <div className="rack-screw" />
-          <span className="rack-info">
-            BLE · {SERVICE_UUID.slice(0, 8)}… · v3
-          </span>
-          <div className="rack-screw" />
+        {/* RIGHT PANEL: DYNAMICS RACK & PRESETS */}
+        <div className="xl:col-span-3 flex flex-col gap-6">
+          {/* Dynamics (Gate & Limiter) */}
+          <div className="bg-[#18181B] border border-[#27272A] rounded-2xl p-4 shadow-xl flex flex-col gap-4">
+            <h2 className="text-xs font-mono text-[#71717A] tracking-wider uppercase flex items-center gap-2">
+              <Gauge className="w-4 h-4 text-[#FF1744]" /> Dynamics Compressor
+            </h2>
+
+            <div className="flex flex-col gap-4 bg-black/20 border border-[#27272A]/50 rounded-xl p-3">
+              {/* Noise Gate */}
+              <div className="flex flex-col gap-1.5">
+                <div className="flex justify-between text-[10px] font-mono">
+                  <span className="text-[#A1A1AA] uppercase">Noise Gate Thresh</span>
+                  <span className="text-[#FFB300] font-bold">{sliders.N}%</span>
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  value={sliders.N}
+                  disabled={!isConnected}
+                  onChange={(e) => handleSliderChange("N", parseInt(e.target.value))}
+                  className="w-full accent-[#FFB300] cursor-pointer"
+                />
+              </div>
+
+              {/* Limiter threshold */}
+              <div className="flex flex-col gap-1.5">
+                <div className="flex justify-between text-[10px] font-mono">
+                  <span className="text-[#A1A1AA] uppercase">Limiter Threshold</span>
+                  <span className="text-[#FF1744] font-bold">{sliders.I}%</span>
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  value={sliders.I}
+                  disabled={!isConnected}
+                  onChange={(e) => handleSliderChange("I", parseInt(e.target.value))}
+                  className="w-full accent-[#FF1744] cursor-pointer"
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Preset Matrix */}
+          <div className="bg-[#18181B] border border-[#27272A] rounded-2xl p-4 shadow-xl flex flex-col gap-4">
+            <h2 className="text-xs font-mono text-[#71717A] tracking-wider uppercase flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-[#00E5FF]" /> Equalizer Presets
+            </h2>
+
+            <div className="grid grid-cols-3 gap-2">
+              {PRESETS.map((preset, idx) => {
+                const isActive = activePreset === idx;
+                return (
+                  <button
+                    key={preset.name}
+                    disabled={!isConnected}
+                    onClick={() => handlePresetSelect(idx)}
+                    className={`py-2 px-1 rounded-lg border text-[10px] font-mono font-bold uppercase transition-all truncate text-center cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed ${
+                      isActive
+                        ? "bg-gradient-to-b from-[#00E5FF]/20 to-[#00E5FF]/5 border-[#00E5FF] text-[#00E5FF] shadow-[0_0_10px_rgba(0,229,255,0.1)]"
+                        : "bg-black/20 border-[#27272A] text-[#71717A] hover:border-[#3E3E42]"
+                    }`}
+                  >
+                    {preset.name}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
         </div>
+
       </div>
+
+      {/* Footer System Version */}
+      <footer className="text-center font-mono text-[9px] text-[#52525B] mt-4 pt-4 border-t border-[#27272A]/20">
+        DSP Controller v5.0.0-PRO · Ampli-Smart Bluetooth Suite
+      </footer>
     </main>
   );
 }
